@@ -1,31 +1,64 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+setlocal EnableExtensions
 
 set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 set "TARGET_DIR=%USERPROFILE%\.config\opencode"
 set "LOG_PREFIX=[OpenCode Setup]"
+set "GLOBAL_NPM_PREFIX="
 
 echo %LOG_PREFIX% Starting Windows setup...
 echo.
 
-call :require_source "%SCRIPT_DIR%\opencode.json"
-if errorlevel 1 goto :fail
+if not exist "%SCRIPT_DIR%\opencode.json" (
+  echo %LOG_PREFIX% Missing required source: %SCRIPT_DIR%\opencode.json
+  goto :fail
+)
 
-call :require_source "%SCRIPT_DIR%\opencode.jsonc"
-if errorlevel 1 goto :fail
+if not exist "%SCRIPT_DIR%\opencode.jsonc" (
+  echo %LOG_PREFIX% Missing required source: %SCRIPT_DIR%\opencode.jsonc
+  goto :fail
+)
 
-call :require_source "%SCRIPT_DIR%\.opencode"
-if errorlevel 1 goto :fail
+if not exist "%SCRIPT_DIR%\.opencode" (
+  echo %LOG_PREFIX% Missing required source: %SCRIPT_DIR%\.opencode
+  goto :fail
+)
 
-call :ensure_node
-if errorlevel 1 goto :fail
+where node >nul 2>nul
+if errorlevel 1 (
+  echo %LOG_PREFIX% Node.js was not found. Installing Node.js LTS with winget...
 
-call :ensure_npm
-if errorlevel 1 goto :fail
+  where winget >nul 2>nul
+  if errorlevel 1 (
+    echo %LOG_PREFIX% winget is not available.
+    echo %LOG_PREFIX% Install Node.js LTS manually, then rerun this script.
+    goto :fail
+  )
 
-call :persist_known_node_paths
-call :refresh_runtime_path
+  winget install --id OpenJS.NodeJS.LTS -e --accept-package-agreements --accept-source-agreements --scope user
+  if errorlevel 1 (
+    echo %LOG_PREFIX% winget failed to install Node.js LTS.
+    goto :fail
+  )
+)
+
+set "PATH=%ProgramFiles%\nodejs;%LOCALAPPDATA%\Programs\nodejs;%PATH%"
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$paths = @('%ProgramFiles%\nodejs','%LOCALAPPDATA%\Programs\nodejs'); $userPath = [Environment]::GetEnvironmentVariable('Path','User'); $parts = @(); if ($userPath) { $parts = $userPath -split ';' | Where-Object { $_ } }; foreach ($candidate in $paths) { if (Test-Path $candidate) { $full = [System.IO.Path]::GetFullPath($candidate); if ($parts -notcontains $full) { $parts += $full } } }; [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')" >nul
+
+where node >nul 2>nul
+if errorlevel 1 (
+  echo %LOG_PREFIX% Node.js is still not available in PATH.
+  echo %LOG_PREFIX% Open a new terminal and rerun this script.
+  goto :fail
+)
+
+where npm >nul 2>nul
+if errorlevel 1 (
+  echo %LOG_PREFIX% npm is not available even though Node.js is installed.
+  goto :fail
+)
 
 echo %LOG_PREFIX% Installing or updating OpenCode with npm...
 call npm install -g opencode-ai
@@ -34,13 +67,16 @@ if errorlevel 1 (
   goto :fail
 )
 
-call :persist_global_npm_path
-call :refresh_runtime_path
+for /f "usebackq delims=" %%I in (`npm prefix -g`) do set "GLOBAL_NPM_PREFIX=%%I"
+if defined GLOBAL_NPM_PREFIX (
+  set "PATH=%GLOBAL_NPM_PREFIX%;%PATH%"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "$candidate = '%GLOBAL_NPM_PREFIX%'; if (Test-Path $candidate) { $full = [System.IO.Path]::GetFullPath($candidate); $userPath = [Environment]::GetEnvironmentVariable('Path','User'); $parts = @(); if ($userPath) { $parts = $userPath -split ';' | Where-Object { $_ } }; if ($parts -notcontains $full) { $parts += $full; [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User') } }" >nul
+)
 
 where opencode >nul 2>nul
 if errorlevel 1 (
   echo %LOG_PREFIX% OpenCode was installed but is not available in PATH yet.
-  echo %LOG_PREFIX% Open a new terminal and run the script again.
+  echo %LOG_PREFIX% Open a new terminal and rerun this script.
   goto :fail
 )
 
@@ -68,9 +104,8 @@ if errorlevel 1 (
 
 echo %LOG_PREFIX% Copying .opencode assets into the global config directory...
 robocopy "%SCRIPT_DIR%\.opencode" "%TARGET_DIR%" /E /NFL /NDL /NJH /NJS /NP /XD node_modules .git .github .cache dist build >nul
-set "ROBOCOPY_EXIT=%ERRORLEVEL%"
-if %ROBOCOPY_EXIT% GEQ 8 (
-  echo %LOG_PREFIX% Failed to copy .opencode assets. robocopy exit code: %ROBOCOPY_EXIT%
+if errorlevel 8 (
+  echo %LOG_PREFIX% Failed to copy .opencode assets.
   goto :fail
 )
 
@@ -86,11 +121,25 @@ call opencode --version
 if errorlevel 1 goto :fail
 
 echo.
-echo %LOG_PREFIX% Inspecting resolved OpenCode config...
-call opencode debug config
-if errorlevel 1 (
-  echo %LOG_PREFIX% OpenCode is installed, but config verification returned an error.
-  echo %LOG_PREFIX% You can still run opencode and finish provider setup with /connect.
+echo %LOG_PREFIX% Verifying copied config files...
+if not exist "%TARGET_DIR%\opencode.json" (
+  echo %LOG_PREFIX% Missing copied file: %TARGET_DIR%\opencode.json
+  goto :fail
+)
+
+if not exist "%TARGET_DIR%\opencode.jsonc" (
+  echo %LOG_PREFIX% Missing copied file: %TARGET_DIR%\opencode.jsonc
+  goto :fail
+)
+
+if not exist "%TARGET_DIR%\plugins\agent-validator.ts" (
+  echo %LOG_PREFIX% Missing copied plugin file: %TARGET_DIR%\plugins\agent-validator.ts
+  goto :fail
+)
+
+if not exist "%TARGET_DIR%\skills\brainstorming\SKILL.md" (
+  echo %LOG_PREFIX% Missing copied skill file: %TARGET_DIR%\skills\brainstorming\SKILL.md
+  goto :fail
 )
 
 echo.
@@ -101,89 +150,6 @@ echo   1. Run: opencode
 echo   2. In the TUI, run: /connect
 echo   3. In a project, run: /init
 goto :end
-
-:require_source
-if exist "%~1" exit /b 0
-echo %LOG_PREFIX% Missing required source: %~1
-exit /b 1
-
-:ensure_node
-where node >nul 2>nul
-if not errorlevel 1 exit /b 0
-
-echo %LOG_PREFIX% Node.js was not found. Installing Node.js LTS with winget...
-where winget >nul 2>nul
-if errorlevel 1 (
-  echo %LOG_PREFIX% winget is not available.
-  echo %LOG_PREFIX% Install Node.js LTS manually, then rerun this script.
-  exit /b 1
-)
-
-winget install --id OpenJS.NodeJS.LTS -e --accept-package-agreements --accept-source-agreements --scope user
-if errorlevel 1 (
-  echo %LOG_PREFIX% winget failed to install Node.js LTS.
-  exit /b 1
-)
-
-call :persist_known_node_paths
-call :refresh_runtime_path
-
-where node >nul 2>nul
-if not errorlevel 1 exit /b 0
-
-echo %LOG_PREFIX% Node.js was installed, but PATH has not refreshed in this terminal.
-echo %LOG_PREFIX% Open a new terminal and rerun this script.
-exit /b 1
-
-:ensure_npm
-where npm >nul 2>nul
-if not errorlevel 1 exit /b 0
-
-call :refresh_runtime_path
-where npm >nul 2>nul
-if not errorlevel 1 exit /b 0
-
-echo %LOG_PREFIX% npm is not available even though Node.js is installed.
-exit /b 1
-
-:persist_known_node_paths
-call :persist_node_path "%ProgramFiles%\nodejs"
-if defined ProgramFiles(x86) call :persist_node_path "%ProgramFiles(x86)%\nodejs"
-call :persist_node_path "%LOCALAPPDATA%\Programs\nodejs"
-exit /b 0
-
-:persist_node_path
-if exist "%~1\node.exe" call :persist_path_entry "%~1"
-exit /b 0
-
-:persist_global_npm_path
-set "GLOBAL_NPM_PREFIX="
-for /f "usebackq delims=" %%I in (`npm prefix -g`) do set "GLOBAL_NPM_PREFIX=%%I"
-if defined GLOBAL_NPM_PREFIX call :persist_path_entry "%GLOBAL_NPM_PREFIX%"
-exit /b 0
-
-:persist_path_entry
-set "PATH_ENTRY=%~1"
-if not exist "%PATH_ENTRY%" exit /b 0
-
-echo ;%PATH%; | find /I ";%PATH_ENTRY%;" >nul
-if errorlevel 1 set "PATH=%PATH_ENTRY%;%PATH%"
-
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$entry = [System.IO.Path]::GetFullPath($env:PATH_ENTRY); $userPath = [Environment]::GetEnvironmentVariable('Path','User'); $parts = @(); if ($userPath) { $parts = $userPath -split ';' | Where-Object { $_ } }; if ($parts -notcontains $entry) { $newPath = @($parts + $entry) -join ';'; [Environment]::SetEnvironmentVariable('Path', $newPath, 'User') }" >nul
-exit /b 0
-
-:refresh_runtime_path
-call :prepend_runtime_path "%ProgramFiles%\nodejs"
-if defined ProgramFiles(x86) call :prepend_runtime_path "%ProgramFiles(x86)%\nodejs"
-call :prepend_runtime_path "%LOCALAPPDATA%\Programs\nodejs"
-call :prepend_runtime_path "%APPDATA%\npm"
-exit /b 0
-
-:prepend_runtime_path
-if not exist "%~1" exit /b 0
-echo ;%PATH%; | find /I ";%~1;" >nul
-if errorlevel 1 set "PATH=%~1;%PATH%"
-exit /b 0
 
 :fail
 echo.
