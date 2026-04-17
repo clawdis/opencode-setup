@@ -4,13 +4,14 @@ This repository is a portable Windows setup for OpenCode.
 
 It is meant for users who want to:
 - install Node.js if it is missing
+- repair Node.js or npm automatically if the runtime is broken or incomplete
 - install OpenCode with `npm`
 - copy the prepared global config into `%USERPROFILE%\.config\opencode`
 - copy the prepared global `.opencode` assets into the same config directory
 
 ## What gets installed
 
-- `Node.js LTS` via `winget` when `node` is not available
+- `Node.js LTS` via `winget` when `node` or `npm` is not ready
 - `opencode-ai` via `npm install -g opencode-ai`
 
 ## What gets copied
@@ -46,5 +47,5 @@ Then inside OpenCode:
 ## Notes
 
 - Official docs recommend WSL for the best Windows experience, but this setup targets native Windows.
-- The script expects `winget` to be available if Node.js must be installed automatically.
+- The script expects `winget` to be available if `Node.js` or `npm` must be repaired or installed automatically.
 - The script keeps the console open at the end so users can read any errors.
