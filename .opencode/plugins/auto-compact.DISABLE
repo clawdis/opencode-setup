@@ -1,0 +1,649 @@
+import type { Plugin } from "@opencode-ai/plugin";
+
+// ─── Model context limits ───────────────────────────────────────────
+function getContextLimit(modelID: string): number {
+  const id = modelID.toLowerCase();
+  if (/claude/.test(id)) return 200_000;
+  if (/gpt-4o/.test(id)) return 128_000;
+  if (/gpt-4-turbo/.test(id)) return 128_000;
+  if (/gpt-5/.test(id)) return 200_000;
+  if (/gemini/.test(id)) return 1_000_000;
+  if (/o1|o3|o4/.test(id)) return 200_000;
+  return 200_000;
+}
+
+// ─── Config ─────────────────────────────────────────────────────────
+const CONFIG = {
+  /** Ratio 0–1. Notify when usage >= threshold */
+  COMPACTION_THRESHOLD: 0.9,
+  /** Seconds to wait for the model to ask the question after prompt */
+  MODEL_ASK_TIMEOUT_S: 30,
+  /** Seconds to wait for user to answer the question */
+  USER_ANSWER_TIMEOUT_S: 60,
+  /** Cooldown after compaction completes — blocks re-notify (ms) */
+  COMPACT_COOLDOWN_MS: 180_000, // 3 min
+  /** Cooldown after skip/continue — blocks re-notify (ms) */
+  SKIP_COOLDOWN_MS: 120_000, // 2 min
+  /** Timeout for compaction operation itself (ms) */
+  COMPACTION_TIMEOUT_MS: 120_000, // 2 min
+  /** Send auto-continue prompt after compaction or skip */
+  AUTO_CONTINUE: true,
+};
+
+// ─── Types ──────────────────────────────────────────────────────────
+interface TokenUsage {
+  ratio: number;
+  totalUsed: number;
+  contextLimit: number;
+  modelID: string;
+  providerID: string;
+}
+
+/**
+ * State machine for the Question flow:
+ * - idle:       Normal operation, monitoring tokens
+ * - prompting:  Sent session.prompt() to model, waiting for model to call ask tool
+ * - waiting:    Model asked question (question.asked), waiting for user answer
+ * - compacting: User chose "Compact + Continue", compaction in progress
+ */
+type QuestionFlowState = "idle" | "prompting" | "waiting" | "compacting";
+
+interface SessionState {
+  flowState: QuestionFlowState;
+  /** The question request ID from question.asked — used to match question.replied */
+  questionRequestID?: string;
+  /** Timeout: model must ask within MODEL_ASK_TIMEOUT_S */
+  modelAskTimeout?: ReturnType<typeof setTimeout>;
+  /** Timeout: user must answer within USER_ANSWER_TIMEOUT_S */
+  userAnswerTimeout?: ReturnType<typeof setTimeout>;
+  /** Pending compaction resolve/reject */
+  pendingCompaction?: {
+    resolve: () => void;
+    reject: (err: Error) => void;
+    timeoutId: ReturnType<typeof setTimeout>;
+  };
+}
+// ─── Plugin ─────────────────────────────────────────────────────────
+export const AutoCompactPlugin: Plugin = async (ctx) => {
+  // ── State ──
+  const lastCompactTime = new Map<string, number>();
+  const lastSkipTime = new Map<string, number>();
+  /** TIER 1 stores usage here; TIER 2 reads it */
+  const latestTokenUsage = new Map<string, TokenUsage>();
+  /** Per-session question flow state */
+  const sessionStates = new Map<string, SessionState>();
+
+  // Model/provider tracking — updated on every assistant message
+  let lastModelID = "";
+  let lastProviderID = "";
+
+  // ── Helpers ──
+  const log = async (level: "debug" | "info" | "error" | "warn", message: string) => {
+    try {
+      await ctx.client.app.log({ body: { service: "auto-compact", level, message } });
+    } catch { /* swallow */ }
+  };
+
+  function getState(sessionID: string): SessionState {
+    let s = sessionStates.get(sessionID);
+    if (!s) {
+      s = { flowState: "idle" };
+      sessionStates.set(sessionID, s);
+    }
+    return s;
+  }
+
+  function isOnCompactCooldown(sessionID: string): boolean {
+    const last = lastCompactTime.get(sessionID);
+    if (!last) return false;
+    return Date.now() - last < CONFIG.COMPACT_COOLDOWN_MS;
+  }
+
+  function isOnSkipCooldown(sessionID: string): boolean {
+    const last = lastSkipTime.get(sessionID);
+    if (!last) return false;
+    return Date.now() - last < CONFIG.SKIP_COOLDOWN_MS;
+  }
+
+  function clearAllTimers(state: SessionState) {
+    if (state.modelAskTimeout) {
+      clearTimeout(state.modelAskTimeout);
+      state.modelAskTimeout = undefined;
+    }
+    if (state.userAnswerTimeout) {
+      clearTimeout(state.userAnswerTimeout);
+      state.userAnswerTimeout = undefined;
+    }
+    if (state.pendingCompaction) {
+      clearTimeout(state.pendingCompaction.timeoutId);
+      state.pendingCompaction = undefined;
+    }
+  }
+
+  function resetState(sessionID: string) {
+    const state = sessionStates.get(sessionID);
+    if (state) {
+      clearAllTimers(state);
+    }
+    sessionStates.set(sessionID, { flowState: "idle" });
+  }
+
+  // ── Cleanup session state ──
+  function cleanupSession(sessionID: string) {
+    resetState(sessionID);
+    sessionStates.delete(sessionID);
+    lastCompactTime.delete(sessionID);
+    lastSkipTime.delete(sessionID);
+    latestTokenUsage.delete(sessionID);
+  }
+
+  // ── Auto-continue (shared by both compact and skip paths) ──
+  async function sendAutoContinue(sessionID: string, reason: string) {
+    if (!CONFIG.AUTO_CONTINUE) return;
+    await ctx.client.session.prompt({
+      path: { id: sessionID },
+      body: {
+        parts: [{ type: "text", text: reason }],
+        model: { providerID: lastProviderID, modelID: lastModelID },
+      },
+      query: { directory: ctx.directory },
+    }).catch(() => { });
+    await log("info", `Auto-continue sent (${reason.slice(0, 60)}...)`);
+  }
+
+  // ── Skip path — auto-continue without compacting ──
+  async function handleSkip(sessionID: string, reason: string) {
+    resetState(sessionID);
+    latestTokenUsage.delete(sessionID);
+    lastSkipTime.set(sessionID, Date.now());
+
+    await log("info", `SKIP — ${reason}`);
+
+    await ctx.client.tui.showToast({
+      body: {
+        title: "Compaction Skipped",
+        message: "Continuing without compacting.",
+        variant: "info",
+        duration: 3000,
+      },
+    }).catch(() => { });
+
+    await sendAutoContinue(
+      sessionID,
+      "Continue from where you left off. (Context compaction was offered but skipped.)",
+    );
+  }
+
+  // ── Stop path — do nothing, let the agent stop ──
+  async function handleStop(sessionID: string) {
+    resetState(sessionID);
+    latestTokenUsage.delete(sessionID);
+    lastSkipTime.set(sessionID, Date.now());
+
+    await log("info", `STOP — user chose to stop`);
+
+    await ctx.client.tui.showToast({
+      body: {
+        title: "Stopped",
+        message: "Agent stopped by user request.",
+        variant: "info",
+        duration: 3000,
+      },
+    }).catch(() => { });
+    // Do NOT send auto-continue — user wants to stop
+  }
+
+  // ── Compact path — summarize then auto-continue ──
+  async function handleCompact(sessionID: string) {
+    const state = getState(sessionID);
+    state.flowState = "compacting";
+
+    await log("info", `COMPACT — user chose to compact`);
+
+    await ctx.client.tui.showToast({
+      body: {
+        title: "Compacting...",
+        message: "Summarizing session to free context.",
+        variant: "warning",
+        duration: 4000,
+      },
+    }).catch(() => { });
+
+    try {
+      // Set up completion listener BEFORE calling summarize
+      const compactionPromise = new Promise<void>((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          state.pendingCompaction = undefined;
+          reject(new Error("Compaction timed out"));
+        }, CONFIG.COMPACTION_TIMEOUT_MS);
+        state.pendingCompaction = { resolve, reject, timeoutId };
+      });
+
+      // Start compaction
+      await ctx.client.session.summarize({
+        path: { id: sessionID },
+        body: { providerID: lastProviderID, modelID: lastModelID },
+        query: { directory: ctx.directory },
+      });
+
+      // Wait for summary=true event to resolve the promise
+      await compactionPromise;
+
+      // Compaction complete
+      resetState(sessionID);
+      lastCompactTime.set(sessionID, Date.now());
+      latestTokenUsage.delete(sessionID);
+
+      await log("info", `Compact DONE — session ${sessionID.slice(0, 8)}`);
+
+      await ctx.client.tui.showToast({
+        body: {
+          title: "Compaction Complete",
+          message: "Session summarized. Continuing...",
+          variant: "success",
+          duration: 3000,
+        },
+      }).catch(() => { });
+
+      await sendAutoContinue(
+        sessionID,
+        "Context was compacted. Continue from where you left off — check the summary above.",
+      );
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await log("error", `Compact FAILED: ${errMsg}`);
+      resetState(sessionID);
+
+      await ctx.client.tui.showToast({
+        body: {
+          title: "Compaction Failed",
+          message: errMsg.slice(0, 100),
+          variant: "error",
+          duration: 5000,
+        },
+      }).catch(() => { });
+
+      // Fall through — auto-continue so agent doesn't hang
+      await sendAutoContinue(
+        sessionID,
+        "Context compaction was attempted but failed. Continue from where you left off.",
+      );
+    }
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // NOTIFY — Send a prompt to the model asking it to use its ask/question tool
+  // to present the user with 3 options. State: idle → prompting.
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  async function notifyUser(sessionID: string, usage: TokenUsage): Promise<void> {
+    const state = getState(sessionID);
+
+    // Guard: not idle
+    if (state.flowState !== "idle") return;
+    // Guard: cooldowns
+    if (isOnCompactCooldown(sessionID)) return;
+    if (isOnSkipCooldown(sessionID)) return;
+
+    const pct = Math.round(usage.ratio * 100);
+    state.flowState = "prompting";
+
+    await log("warn", `NOTIFY — context at ${pct}%. Prompting model to ask user.`);
+
+    // Start timeout — if model doesn't ask within MODEL_ASK_TIMEOUT_S, auto-continue
+    state.modelAskTimeout = setTimeout(async () => {
+      state.modelAskTimeout = undefined;
+      if (state.flowState === "prompting") {
+        await log("warn", `Model did not ask question within ${CONFIG.MODEL_ASK_TIMEOUT_S}s — auto-continuing`);
+        await handleSkip(sessionID, "Model did not ask question (timeout)");
+      }
+    }, CONFIG.MODEL_ASK_TIMEOUT_S * 1000);
+
+    // Send prompt to model instructing it to use its ask/question tool
+    const promptText = [
+      `SYSTEM INSTRUCTION — CONTEXT WINDOW ALERT`,
+      ``,
+      `Your context window is at ${pct}% capacity (${usage.totalUsed.toLocaleString()} / ${usage.contextLimit.toLocaleString()} tokens).`,
+      ``,
+      `You MUST use your ask/question tool to present the user with this choice.`,
+      `Do NOT respond with text. ONLY call the ask tool with these exact parameters:`,
+      ``,
+      `Header: "Context Window High"`,
+      `Question: "Context at ${pct}% (${usage.totalUsed.toLocaleString()}/${usage.contextLimit.toLocaleString()} tokens). What would you like to do?"`,
+      `Options:`,
+      `  1. Label: "Compact + Continue"  |  Description: "Summarize session to free context, then continue working"`,
+      `  2. Label: "Continue"  |  Description: "Keep working without compacting"`,
+      `  3. Label: "Stop"  |  Description: "Stop the current task"`,
+      ``,
+      `IMPORTANT: Use the ask tool. Do not type a text response.`,
+    ].join("\n");
+
+    await ctx.client.session.prompt({
+      path: { id: sessionID },
+      body: {
+        parts: [{ type: "text", text: promptText }],
+        model: { providerID: usage.providerID, modelID: usage.modelID },
+      },
+      query: { directory: ctx.directory },
+    }).catch(async (err) => {
+      await log("error", `Failed to send question prompt: ${err}`);
+      await handleSkip(sessionID, "Failed to send question prompt");
+    });
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // QUESTION EVENT HANDLERS
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  /** question.asked — model called its ask tool. Record requestID, start user timeout. */
+  function handleQuestionAsked(sessionID: string, requestID: string) {
+    const state = getState(sessionID);
+
+    // Only handle if we're in the prompting state (we triggered this)
+    if (state.flowState !== "prompting") return;
+
+    // Cancel model-ask timeout
+    if (state.modelAskTimeout) {
+      clearTimeout(state.modelAskTimeout);
+      state.modelAskTimeout = undefined;
+    }
+
+    state.flowState = "waiting";
+    state.questionRequestID = requestID;
+
+    log("info", `Question asked — requestID=${requestID.slice(0, 8)}, waiting for user answer`);
+
+    // Start user-answer timeout
+    state.userAnswerTimeout = setTimeout(async () => {
+      state.userAnswerTimeout = undefined;
+      if (state.flowState === "waiting") {
+        await log("warn", `User did not answer within ${CONFIG.USER_ANSWER_TIMEOUT_S}s — auto-continuing`);
+        // Reject the unanswered question so the UI clears it
+        await ctx.client.question.reject({
+          requestID,
+          directory: ctx.directory,
+        }).catch(() => { });
+        await handleSkip(sessionID, "User did not answer question (timeout)");
+      }
+    }, CONFIG.USER_ANSWER_TIMEOUT_S * 1000);
+  }
+
+  /** question.replied — user selected an option. Parse and act. */
+  async function handleQuestionReplied(
+    sessionID: string,
+    requestID: string,
+    answers: Array<Array<string>>,
+  ) {
+    const state = getState(sessionID);
+
+    // Only handle if we're waiting AND this is our question
+    if (state.flowState !== "waiting") return;
+    if (state.questionRequestID !== requestID) return;
+
+    // Cancel user-answer timeout
+    if (state.userAnswerTimeout) {
+      clearTimeout(state.userAnswerTimeout);
+      state.userAnswerTimeout = undefined;
+    }
+
+    // Parse answer — first question, first selected option
+    const selectedLabels = answers?.[0] ?? [];
+    const answer = selectedLabels.join(" ").toLowerCase();
+
+    await log("info", `User answered: "${selectedLabels.join(", ")}"`);
+
+    if (answer.includes("compact")) {
+      // Compact + Continue
+      await handleCompact(sessionID);
+    } else if (answer.includes("stop")) {
+      // Stop
+      await handleStop(sessionID);
+    } else {
+      // Continue (or any other answer including custom typed text)
+      await handleSkip(sessionID, "User chose to continue without compacting");
+    }
+  }
+
+  /** question.rejected — user pressed Esc. Treat as "Continue". */
+  async function handleQuestionRejected(sessionID: string, requestID: string) {
+    const state = getState(sessionID);
+
+    // Only handle if we're waiting AND this is our question
+    if (state.flowState !== "waiting") return;
+    if (state.questionRequestID !== requestID) return;
+
+    await log("info", `User rejected question (Esc) — continuing without compact`);
+    await handleSkip(sessionID, "User dismissed question (Esc)");
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // STARTUP LOG
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  await log("info", [
+    `Auto-compact ON (question mode)`,
+    `threshold: ${CONFIG.COMPACTION_THRESHOLD * 100}%`,
+    `model-ask-timeout: ${CONFIG.MODEL_ASK_TIMEOUT_S}s`,
+    `user-answer-timeout: ${CONFIG.USER_ANSWER_TIMEOUT_S}s`,
+  ].join(" — "));
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // HOOKS
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  return {
+    event: async ({ event }: { event: { type: string; properties?: unknown } }) => {
+      const props = event.properties as Record<string, unknown> | undefined;
+
+      // ─── Session cleanup ───
+      if (event.type === "session.deleted") {
+        const info = props?.info as Record<string, unknown> | undefined;
+        const sid = (info?.id ?? info?.sessionID ?? props?.sessionID) as string | undefined;
+        if (sid) cleanupSession(sid);
+        return;
+      }
+
+      // ─── Session compacted (dedicated event) ───
+      if (event.type === "session.compacted") {
+        const sessionID = props?.sessionID as string | undefined;
+        if (!sessionID) return;
+
+        const state = getState(sessionID);
+        // Resolve pending compaction promise if we triggered it
+        if (state.flowState === "compacting" && state.pendingCompaction) {
+          clearTimeout(state.pendingCompaction.timeoutId);
+          state.pendingCompaction.resolve();
+          state.pendingCompaction = undefined;
+        }
+        return;
+      }
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // QUESTION EVENTS
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+      if (event.type === "question.asked") {
+        // properties = QuestionRequest { id, sessionID, questions, tool? }
+        const sessionID = props?.sessionID as string | undefined;
+        const requestID = props?.id as string | undefined;
+        if (sessionID && requestID) {
+          handleQuestionAsked(sessionID, requestID);
+        }
+        return;
+      }
+
+      if (event.type === "question.replied") {
+        // properties = { sessionID, requestID, answers: Array<Array<string>> }
+        const sessionID = props?.sessionID as string | undefined;
+        const requestID = props?.requestID as string | undefined;
+        const answers = props?.answers as Array<Array<string>> | undefined;
+        if (sessionID && requestID) {
+          await handleQuestionReplied(sessionID, requestID, answers ?? []);
+        }
+        return;
+      }
+
+      if (event.type === "question.rejected") {
+        // properties = { sessionID, requestID }
+        const sessionID = props?.sessionID as string | undefined;
+        const requestID = props?.requestID as string | undefined;
+        if (sessionID && requestID) {
+          await handleQuestionRejected(sessionID, requestID);
+        }
+        return;
+      }
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // TIER 1 — OBSERVE (message.updated)
+      // Track tokens + detect compaction completion.
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      if (event.type === "message.updated") {
+        const info = props?.info as Record<string, unknown> | undefined;
+        if (!info) return;
+
+        const sessionID = info.sessionID as string | undefined;
+        if (!sessionID) return;
+
+        const state = getState(sessionID);
+
+        // ── User typed a message → cancel any pending question flow ──
+        if (info.role === "user") {
+          if (state.flowState === "prompting" || state.flowState === "waiting") {
+            resetState(sessionID);
+            latestTokenUsage.delete(sessionID);
+            lastSkipTime.set(sessionID, Date.now());
+            await log("info", `User sent message during question flow — flow cancelled`);
+          }
+          return;
+        }
+
+        // Only process assistant messages below
+        if (info.role !== "assistant") return;
+
+        // Track model/provider from every assistant message
+        if (info.modelID) lastModelID = info.modelID as string;
+        if (info.providerID) lastProviderID = info.providerID as string;
+
+        // ── Summary completion → resolve pendingCompaction ──
+        if (info.summary === true) {
+          if (state.flowState === "compacting" && state.pendingCompaction) {
+            clearTimeout(state.pendingCompaction.timeoutId);
+            state.pendingCompaction.resolve();
+            state.pendingCompaction = undefined;
+          }
+          return;
+        }
+
+        // Skip token tracking if flow is not idle
+        if (state.flowState !== "idle") return;
+        // Skip if on cooldown
+        if (isOnCompactCooldown(sessionID)) return;
+        if (isOnSkipCooldown(sessionID)) return;
+
+        // ── Token tracking — store but DON'T act ──
+        const tokens = info.tokens as Record<string, unknown> | undefined;
+        if (!tokens) return;
+
+        const inputTokens = (tokens.input as number) || 0;
+        const cacheRead = ((tokens.cache as Record<string, unknown>)?.read as number) || 0;
+        const totalUsed = inputTokens + cacheRead;
+        if (totalUsed === 0) return;
+
+        const modelID = lastModelID || (info.modelID as string) || "";
+        const providerID = lastProviderID || (info.providerID as string) || "";
+        const contextLimit = getContextLimit(modelID);
+        const usageRatio = totalUsed / contextLimit;
+
+        // Store if over threshold — session.idle will pick it up
+        if (usageRatio >= CONFIG.COMPACTION_THRESHOLD) {
+          latestTokenUsage.set(sessionID, {
+            ratio: usageRatio,
+            totalUsed,
+            contextLimit,
+            modelID,
+            providerID,
+          });
+          await log("warn", `Tokens over threshold: ${Math.round(usageRatio * 100)}% — waiting for session.idle`);
+        }
+
+        return;
+      }
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // TIER 2 — DECIDE (session.idle)
+      // If threshold exceeded, prompt model to ask user via Question dialog.
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      if (event.type === "session.idle") {
+        const sessionID = props?.sessionID as string | undefined;
+        if (!sessionID) return;
+
+        const usage = latestTokenUsage.get(sessionID);
+        if (!usage) return;
+
+        if (usage.ratio >= CONFIG.COMPACTION_THRESHOLD) {
+          await log("info", `Session idle — prompting question at ${Math.round(usage.ratio * 100)}%`);
+          await notifyUser(sessionID, usage);
+        }
+
+        return;
+      }
+    },
+
+    // ── Custom compaction prompt ──
+    "experimental.session.compacting": async (_input: any, output: any) => {
+      output.prompt = `You are summarizing a coding session that was auto-compacted due to high context usage.
+Create a comprehensive, structured summary preserving ALL information needed to continue work seamlessly.
+
+## REQUIRED STRUCTURE:
+
+### Goal
+- What is the overall objective of this session?
+- What specific feature/fix/task is being worked on?
+
+### Active Task
+- What is being worked on right now?
+- What is the current step in the workflow?
+
+### Progress
+- Steps completed so far (ordered)
+- Last action taken before compaction
+
+### Key Decisions
+- Architecture/design choices made and WHY
+- Trade-offs that were considered
+- User preferences expressed during session
+
+### Discoveries
+- Important findings during research/exploration
+- SDK limitations, API behaviors, edge cases discovered
+- Things that did NOT work and why
+
+### Files Touched
+List every file modified, created, or read - with WHAT changed and WHY:
+- \`path/to/file\` - description of change
+
+### Pending Work
+- What still needs to be done (ordered by priority)
+- Known issues, blockers, or errors encountered
+- Immediate next step to take
+
+### Critical Context
+- Important variable names, function signatures, patterns
+- Error messages and their solutions
+- Configuration values, paths, URLs that matter
+- Project-specific conventions discovered
+
+### User Agreements
+- Explicit user requests or rejections
+- Working style preferences
+- Approval status of any pending plans
+
+### Instructions
+- How the user communicates (language preferences)
+- Special workflows or processes to follow
+- Things to NEVER do (user-specified constraints)
+
+IMPORTANT: After compaction, this summary is the ONLY context available.
+Missing information means lost progress. Be thorough and precise.`;
+    },
+  };
+};
+
+export default AutoCompactPlugin;

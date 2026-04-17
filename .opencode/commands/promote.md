@@ -1,0 +1,31 @@
+---
+description: Promote project-scoped instincts to global scope
+---
+
+# /promote - Promote Instincts
+
+Promote instincts from project scope to global scope.
+
+## Implementation
+
+```bash
+python3 .opencode/skills/continuous-learning-v2/scripts/instinct-cli.py promote [instinct-id] [--force] [--dry-run]
+```
+
+## Usage
+
+```bash
+/promote                      # Auto-detect promotion candidates
+/promote --dry-run            # Preview auto-promotion candidates
+/promote --force              # Promote all qualified candidates without prompt
+/promote grep-before-edit     # Promote one specific instinct from current project
+```
+
+## What to Do
+
+1. Detect current project
+2. If `instinct-id` is provided, promote only that instinct (if present in current project)
+3. Otherwise, find cross-project candidates that:
+   - Appear in at least 2 projects
+   - Meet confidence threshold (>= 0.8)
+4. Write promoted instincts to `~/.opencode/homunculus/instincts/personal/` with `scope: global`
