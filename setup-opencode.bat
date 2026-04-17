@@ -8,6 +8,9 @@ set "LOG_PREFIX=[OpenCode Setup]"
 set "GLOBAL_NPM_PREFIX="
 set "NODE_RUNTIME_READY=0"
 set "TEST_REPAIR_MODE=0"
+set "NODE_CMD="
+set "NPM_CMD="
+set "OPENCODE_CMD="
 
 :: == Parse flags ==============================================================
 :parse_args
@@ -83,21 +86,33 @@ if not "!NODE_RUNTIME_READY!"=="1" (
 )
 
 echo %LOG_PREFIX% Installing or updating OpenCode with npm...
-call npm install -g opencode-ai
+call :resolve_node_runtime_paths
+if not defined NPM_CMD (
+  echo %LOG_PREFIX% Failed to locate npm in the current session.
+  goto :fail
+)
+call "%NPM_CMD%" install -g opencode-ai
 if errorlevel 1 (
   echo %LOG_PREFIX% Failed to install opencode-ai.
   goto :fail
 )
 
-for /f "usebackq delims=" %%I in (`npm prefix -g`) do set "GLOBAL_NPM_PREFIX=%%I"
+echo %LOG_PREFIX% Configuring PowerShell execution policy for the current user...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force"
+if errorlevel 1 (
+  echo %LOG_PREFIX% Failed to set PowerShell ExecutionPolicy to RemoteSigned for CurrentUser.
+  goto :fail
+)
+
+for /f "delims=" %%I in ('"%NPM_CMD%" prefix -g') do set "GLOBAL_NPM_PREFIX=%%I"
 if defined GLOBAL_NPM_PREFIX (
   set "PATH=%GLOBAL_NPM_PREFIX%;%PATH%"
   powershell -NoProfile -ExecutionPolicy Bypass -Command "$candidate = '%GLOBAL_NPM_PREFIX%'; if (Test-Path $candidate) { $full = [System.IO.Path]::GetFullPath($candidate); $userPath = [Environment]::GetEnvironmentVariable('Path','User'); $parts = @(); if ($userPath) { $parts = $userPath -split ';' | Where-Object { $_ } }; if ($parts -notcontains $full) { $parts += $full; [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User') } }" >nul
 )
 
-where opencode >nul 2>nul
-if errorlevel 1 (
-  echo %LOG_PREFIX% OpenCode was installed but is not in PATH yet.
+call :resolve_opencode_cmd
+if not defined OPENCODE_CMD (
+  echo %LOG_PREFIX% OpenCode was installed but could not be located in this session.
   echo %LOG_PREFIX% Open a new terminal and rerun this script.
   goto :fail
 )
@@ -133,13 +148,19 @@ if errorlevel 8 (
 
 echo.
 echo %LOG_PREFIX% Verifying installation...
-call node -v
+call :resolve_node_runtime_paths
+call :resolve_opencode_cmd
+if not defined NODE_CMD goto :fail
+if not defined NPM_CMD goto :fail
+if not defined OPENCODE_CMD goto :fail
+
+call "%NODE_CMD%" -v
 if errorlevel 1 goto :fail
 
-call npm -v
+call "%NPM_CMD%" -v
 if errorlevel 1 goto :fail
 
-call opencode --version
+call "%OPENCODE_CMD%" --version
 if errorlevel 1 goto :fail
 
 echo.
@@ -207,19 +228,63 @@ exit /b 0
 ::
 :check_node_runtime
 set "NODE_RUNTIME_READY=0"
-call node -v >nul 2>nul
+call :resolve_node_runtime_paths
+if not defined NODE_CMD (
+  echo %LOG_PREFIX%   [check] node: NOT FOUND
+  exit /b 0
+)
+call "%NODE_CMD%" -v >nul 2>nul
 if errorlevel 1 (
   echo %LOG_PREFIX%   [check] node: NOT FOUND
   exit /b 0
 )
 echo %LOG_PREFIX%   [check] node: OK
-call npm -v >nul 2>nul
+if not defined NPM_CMD (
+  echo %LOG_PREFIX%   [check] npm:  NOT FOUND
+  exit /b 0
+)
+call "%NPM_CMD%" -v >nul 2>nul
 if errorlevel 1 (
   echo %LOG_PREFIX%   [check] npm:  NOT FOUND
   exit /b 0
 )
 echo %LOG_PREFIX%   [check] npm:  OK
 set "NODE_RUNTIME_READY=1"
+exit /b 0
+
+:resolve_node_runtime_paths
+set "NODE_CMD="
+set "NPM_CMD="
+for %%F in ("%ProgramFiles%\nodejs\node.exe" "%LOCALAPPDATA%\Programs\nodejs\node.exe") do (
+  if not defined NODE_CMD if exist "%%~F" set "NODE_CMD=%%~F"
+)
+for %%F in ("%ProgramFiles%\nodejs\npm.cmd" "%LOCALAPPDATA%\Programs\nodejs\npm.cmd") do (
+  if not defined NPM_CMD if exist "%%~F" set "NPM_CMD=%%~F"
+)
+if not defined NODE_CMD (
+  for /f "delims=" %%F in ('where node 2^>nul') do (
+    if not defined NODE_CMD set "NODE_CMD=%%F"
+  )
+)
+if not defined NPM_CMD (
+  for /f "delims=" %%F in ('where npm 2^>nul') do (
+    if not defined NPM_CMD set "NPM_CMD=%%F"
+  )
+)
+exit /b 0
+
+:resolve_opencode_cmd
+set "OPENCODE_CMD="
+if defined GLOBAL_NPM_PREFIX (
+  for %%F in ("%GLOBAL_NPM_PREFIX%\opencode.cmd" "%GLOBAL_NPM_PREFIX%\opencode.exe") do (
+    if not defined OPENCODE_CMD if exist "%%~F" set "OPENCODE_CMD=%%~F"
+  )
+)
+if not defined OPENCODE_CMD (
+  for /f "delims=" %%F in ('where opencode 2^>nul') do (
+    if not defined OPENCODE_CMD set "OPENCODE_CMD=%%F"
+  )
+)
 exit /b 0
 
 :fail
